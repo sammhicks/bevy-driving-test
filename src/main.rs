@@ -1,4 +1,10 @@
-use bevy::{math::Mat2, prelude::*};
+use bevy::{
+    asset::{AssetLoader, LoadContext, LoadedAsset},
+    math::Mat2,
+    prelude::*,
+    reflect::TypeUuid,
+    utils::BoxedFuture,
+};
 
 fn clamp(t: f32, min: f32, max: f32) -> (bool, f32) {
     assert!(min <= max);
@@ -23,6 +29,9 @@ struct CarInputs {
     e_brake: f32,
 }
 
+#[derive(Debug, serde::Deserialize, TypeUuid)]
+#[uuid = "e8dbac6d-624d-466b-b38f-84737004b095"]
+#[serde(default)]
 struct CarConfig {
     gravity: f32,
     mass: f32,
@@ -61,8 +70,8 @@ impl Default for CarConfig {
             mass: 1500.0,
             inertia_scale: 1.0,
             half_width: 0.64,
-            centre_of_gravity_to_front: 1.2,
-            centre_of_gravity_to_rear: 1.2,
+            centre_of_gravity_to_front: 1.7,
+            centre_of_gravity_to_rear: 1.7,
             centre_of_gravity_to_front_axle: 1.0,
             centre_of_gravity_to_rear_axle: 1.0,
             centre_of_gravity_height: 0.55,
@@ -86,6 +95,27 @@ impl Default for CarConfig {
             speed_turning_stability: 11.8,
             axle_distance_correction: 1.7,
         }
+    }
+}
+
+#[derive(Default)]
+pub struct CarConfigLoader;
+
+impl AssetLoader for CarConfigLoader {
+    fn load<'a>(
+        &'a self,
+        bytes: &'a [u8],
+        load_context: &'a mut LoadContext,
+    ) -> BoxedFuture<'a, Result<(), anyhow::Error>> {
+        Box::pin(async move {
+            let config = serde_json::from_str::<CarConfig>(std::str::from_utf8(bytes)?)?;
+            load_context.set_default_asset(LoadedAsset::new(config));
+            Ok(())
+        })
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["car"]
     }
 }
 
@@ -131,9 +161,15 @@ fn physics_step(
 ) -> CarStats {
     let inertia = config.mass * config.inertia_scale;
     let track_width = config.half_width * 2.0;
-    let wheel_base = config.centre_of_gravity_to_front_axle + config.centre_of_gravity_to_rear_axle;
-    let axle_weight_ratio_front = config.centre_of_gravity_to_rear_axle / wheel_base;
-    let axle_weight_ratio_rear = config.centre_of_gravity_to_front_axle / wheel_base;
+
+    let centre_of_gravity_to_front_axle =
+        config.centre_of_gravity_to_front_axle * config.axle_distance_correction;
+    let centre_of_gravity_to_rear_axle =
+        config.centre_of_gravity_to_rear_axle * config.axle_distance_correction;
+
+    let wheel_base = centre_of_gravity_to_front_axle + centre_of_gravity_to_rear_axle;
+    let axle_weight_ratio_front = centre_of_gravity_to_rear_axle / wheel_base;
+    let axle_weight_ratio_rear = centre_of_gravity_to_front_axle / wheel_base;
 
     let local_velocity = Mat2::from_angle(-state.heading) * state.velocity;
 
@@ -160,13 +196,13 @@ fn physics_step(
         let rear_right_weight_offset = rear_right_active_weight;
 
         let position = front_left_weight_offset
-            * Vec2::new(config.centre_of_gravity_to_front_axle, config.half_width)
+            * Vec2::new(centre_of_gravity_to_front_axle, config.half_width)
             + front_right_weight_offset
-                * Vec2::new(config.centre_of_gravity_to_front_axle, -config.half_width)
+                * Vec2::new(centre_of_gravity_to_front_axle, -config.half_width)
             + rear_left_weight_offset
-                * Vec2::new(-config.centre_of_gravity_to_rear_axle, config.half_width)
+                * Vec2::new(-centre_of_gravity_to_rear_axle, config.half_width)
             + rear_right_weight_offset
-                * Vec2::new(-config.centre_of_gravity_to_rear_axle, -config.half_width);
+                * Vec2::new(-centre_of_gravity_to_rear_axle, -config.half_width);
 
         let total_weight = front_left_weight_offset
             + front_right_weight_offset
@@ -180,8 +216,8 @@ fn physics_step(
         }
     };
 
-    let yaw_speed_front = config.centre_of_gravity_to_front_axle * state.yaw_rate;
-    let yaw_speed_rear = -config.centre_of_gravity_to_rear_axle * state.yaw_rate;
+    let yaw_speed_front = centre_of_gravity_to_front_axle * state.yaw_rate;
+    let yaw_speed_rear = -centre_of_gravity_to_rear_axle * state.yaw_rate;
 
     let slip_angle_front = f32::atan2(local_velocity.y + yaw_speed_front, local_velocity.x.abs())
         - local_velocity.x.signum() * state.steer_angle;
@@ -254,8 +290,8 @@ fn physics_step(
 
     let mut absolute_velocity = state.velocity.length();
 
-    let mut angular_torque = front_friction * config.centre_of_gravity_to_front_axle
-        - rear_friction * config.centre_of_gravity_to_rear_axle;
+    let mut angular_torque = front_friction * centre_of_gravity_to_front_axle
+        - rear_friction * centre_of_gravity_to_rear_axle;
 
     if absolute_velocity < 0.5 && throttle < f32::EPSILON {
         state.local_acceleration = Vec2::ZERO;
@@ -308,52 +344,81 @@ fn physics_step(
     }
 }
 
+struct Tire;
+
 #[derive(Bundle)]
 struct TireBundle {
     #[bundle]
     sprite: SpriteBundle,
+    tire: Tire,
 }
 
 impl TireBundle {
-    fn new(position: Vec2, material: Handle<ColorMaterial>, config: &CarConfig) -> Self {
+    fn new(material: Handle<ColorMaterial>) -> Self {
         Self {
             sprite: SpriteBundle {
                 sprite: Sprite {
-                    size: Vec2::new(2.0 * config.wheel_radius, config.wheel_width),
+                    size: Vec2::ONE,
                     ..Default::default()
                 },
                 material,
-                transform: Transform::from_translation(position.extend(1.0)),
                 ..Default::default()
             },
+            tire: Tire,
         }
-    }
-
-    fn new_front(y: f32, material: Handle<ColorMaterial>, config: &CarConfig) -> Self {
-        Self::new(
-            Vec2::new(
-                config.centre_of_gravity_to_front_axle,
-                y * config.half_width,
-            ),
-            material,
-            config,
-        )
-    }
-    fn new_rear(y: f32, material: Handle<ColorMaterial>, config: &CarConfig) -> Self {
-        Self::new(
-            Vec2::new(
-                -config.centre_of_gravity_to_rear_axle,
-                y * config.half_width,
-            ),
-            material,
-            config,
-        )
     }
 }
 
-#[derive(Default)]
-struct FrontTire {
-    steer_angle: f32,
+struct Tires {
+    front_left: Entity,
+    front_right: Entity,
+    rear_left: Entity,
+    rear_right: Entity,
+}
+
+struct Bumper;
+
+#[derive(Bundle)]
+struct BumperBundle {
+    #[bundle]
+    sprite: SpriteBundle,
+    bumper: Bumper,
+}
+
+impl BumperBundle {
+    fn new(material: Handle<ColorMaterial>) -> Self {
+        Self {
+            sprite: SpriteBundle {
+                sprite: Sprite {
+                    size: Vec2::ONE,
+                    ..Default::default()
+                },
+                material,
+                ..Default::default()
+            },
+            bumper: Bumper,
+        }
+    }
+}
+
+struct Bumpers {
+    front: Entity,
+    rear: Entity,
+}
+
+struct CarComponents {
+    tires: Tires,
+    bumpers: Bumpers,
+    weight_marker: Entity,
+}
+
+#[derive(Bundle)]
+struct CarBundle {
+    config: Handle<CarConfig>,
+    components: CarComponents,
+    state: CarState,
+    transform: Transform,
+    global_transform: GlobalTransform,
 }
 
 fn setup(
@@ -361,6 +426,8 @@ fn setup(
     mut materials: ResMut<Assets<ColorMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
+    asset_server.watch_for_changes().unwrap();
+
     commands.spawn_bundle({
         let mut camera = OrthographicCameraBundle::new_2d();
 
@@ -395,61 +462,87 @@ fn setup(
         ..Default::default()
     });
 
-    let config = CarConfig::default();
-
     let tire_material = materials.add(ColorMaterial::color(Color::BLACK));
 
     let front_left = commands
-        .spawn_bundle(TireBundle::new_front(1.0, tire_material.clone(), &config))
-        .insert(FrontTire::default())
+        .spawn_bundle(TireBundle::new(tire_material.clone()))
         .id();
     let front_right = commands
-        .spawn_bundle(TireBundle::new_front(-1.0, tire_material.clone(), &config))
-        .insert(FrontTire::default())
+        .spawn_bundle(TireBundle::new(tire_material.clone()))
         .id();
     let rear_left = commands
-        .spawn_bundle(TireBundle::new_rear(1.0, tire_material.clone(), &config))
+        .spawn_bundle(TireBundle::new(tire_material.clone()))
         .id();
-    let rear_right = commands
-        .spawn_bundle(TireBundle::new_rear(-1.0, tire_material, &config))
+    let rear_right = commands.spawn_bundle(TireBundle::new(tire_material)).id();
+
+    let tires = Tires {
+        front_left,
+        front_right,
+        rear_left,
+        rear_right,
+    };
+
+    let bumper_material = materials.add(ColorMaterial::color(Color::DARK_GRAY));
+
+    let front_bumper = commands
+        .spawn_bundle(BumperBundle::new(bumper_material.clone()))
+        .id();
+
+    let rear_bumper = commands
+        .spawn_bundle(BumperBundle::new(bumper_material))
+        .id();
+
+    let bumpers = Bumpers {
+        front: front_bumper,
+        rear: rear_bumper,
+    };
+
+    let weight_marker = commands
+        .spawn_bundle(SpriteBundle {
+            sprite: Sprite {
+                size: 0.5 * Vec2::ONE,
+                ..Default::default()
+            },
+            material: materials.add(ColorMaterial::color(Color::PURPLE)),
+            ..Default::default()
+        })
+        .insert(WeightMarker::default())
         .id();
 
     commands
-        .spawn_bundle(SpriteBundle {
-            sprite: Sprite {
-                size: Vec2::new(
-                    config.centre_of_gravity_to_front + config.centre_of_gravity_to_rear,
-                    2.0 * config.half_width,
-                ),
-                ..Default::default()
+        .spawn_bundle(CarBundle {
+            config: asset_server.load("config.car"),
+            components: CarComponents {
+                tires,
+                bumpers,
+                weight_marker,
             },
-            material: materials.add(ColorMaterial::color(Color::ORANGE_RED)),
-            ..Default::default()
+            state: CarState::default(),
+            transform: Transform::default(),
+            global_transform: GlobalTransform::default(),
         })
-        .insert(config)
-        .insert(CarState::default())
-        .with_children(|parent| {
-            parent
-                .spawn_bundle(SpriteBundle {
-                    sprite: Sprite {
-                        size: 0.5 * Vec2::ONE,
-                        ..Default::default()
-                    },
-                    material: materials.add(ColorMaterial::color(Color::PURPLE)),
-                    transform: Transform::from_translation(Vec3::new(0.0, 0.0, 1.0)),
-                    ..Default::default()
-                })
-                .insert(WeightMarker::default());
-        })
-        .push_children(&[front_left, front_right, rear_left, rear_right]);
+        .push_children(&[
+            front_left,
+            front_right,
+            rear_left,
+            rear_right,
+            front_bumper,
+            rear_bumper,
+            weight_marker,
+        ]);
 }
 
 fn step(
     time: Res<Time>,
     keyboard_input: Res<Input<KeyCode>>,
-    mut cars: Query<(&CarConfig, &mut CarState, &mut Transform, &Children)>,
+    configs: ResMut<Assets<CarConfig>>,
+    mut cars: Query<(
+        &Handle<CarConfig>,
+        &mut CarState,
+        &mut Transform,
+        &CarComponents,
+    )>,
     mut weight_marker: Query<&mut WeightMarker>,
-    mut front_tires: Query<&mut FrontTire>,
     mut text: Query<&mut Text, Without<CarState>>,
 ) {
     let input = |code: KeyCode| {
@@ -466,7 +559,12 @@ fn step(
         e_brake: input(KeyCode::Space),
     };
 
-    for (config, mut state, mut transform, children) in cars.iter_mut() {
+    for (config, mut state, mut transform, car_components) in cars.iter_mut() {
+        let config = match configs.get(config.clone()) {
+            Some(config) => config,
+            None => continue,
+        };
+
         let input_steer = input(KeyCode::Left) - input(KeyCode::Right);
         let target_steer = input_steer
             * (1.0 - (state.velocity.length() / config.speed_steer_correction).min(1.0));
@@ -492,15 +590,10 @@ fn step(
         transform.translation = state.position.extend(1.0);
         transform.rotation = Quat::from_rotation_z(state.heading);
 
-        for &entity in children.iter() {
-            if let Ok(mut weight_marker) = weight_marker.get_mut(entity) {
-                weight_marker.position = stats.weight_position;
-            }
-
-            if let Ok(mut front_tire) = front_tires.get_mut(entity) {
-                front_tire.steer_angle = state.steer_angle;
-            }
-        }
+        weight_marker
+            .get_mut(car_components.weight_marker)
+            .unwrap()
+            .position = stats.weight_position;
 
         text.single_mut().unwrap().sections[0].value = format!("{:#?}", stats);
     }
@@ -512,9 +605,93 @@ fn place_weight_marker(mut query: Query<(&WeightMarker, &mut Transform)>) {
     }
 }
 
-fn animate_wheels(mut front_tires: Query<(&FrontTire, &mut Transform)>) {
-    for (tire, mut transform) in front_tires.iter_mut() {
-        transform.rotation = Quat::from_rotation_z(tire.steer_angle);
+fn place_tires(
+    configs: ResMut<Assets<CarConfig>>,
+    car: Query<(&Handle<CarConfig>, &CarComponents, &CarState)>,
+    mut tires: Query<&mut Transform, With<Tire>>,
+) {
+    for (config, components, state) in car.iter() {
+        let config = match configs.get(config.clone()) {
+            Some(config) => config,
+            None => continue,
+        };
+
+        {
+            let mut tire = tires.get_mut(components.tires.front_left).unwrap();
+
+            tire.translation = Vec3::new(
+                config.centre_of_gravity_to_front_axle,
+                config.half_width,
+                1.0,
+            );
+
+            tire.rotation = Quat::from_rotation_z(state.steer_angle);
+
+            tire.scale = Vec3::new(2.0 * config.wheel_radius, config.wheel_width, 1.0);
+        }
+
+        {
+            let mut tire = tires.get_mut(components.tires.front_right).unwrap();
+
+            tire.translation = Vec3::new(
+                config.centre_of_gravity_to_front_axle,
+                -config.half_width,
+                1.0,
+            );
+
+            tire.rotation = Quat::from_rotation_z(state.steer_angle);
+
+            tire.scale = Vec3::new(2.0 * config.wheel_radius, config.wheel_width, 1.0);
+        }
+
+        {
+            let mut tire = tires.get_mut(components.tires.rear_left).unwrap();
+
+            tire.translation = Vec3::new(
+                -config.centre_of_gravity_to_rear_axle,
+                config.half_width,
+                1.0,
+            );
+
+            tire.scale = Vec3::new(2.0 * config.wheel_radius, config.wheel_width, 1.0);
+        }
+
+        {
+            let mut tire = tires.get_mut(components.tires.rear_right).unwrap();
+
+            tire.translation = Vec3::new(
+                -config.centre_of_gravity_to_rear_axle,
+                -config.half_width,
+                1.0,
+            );
+
+            tire.scale = Vec3::new(2.0 * config.wheel_radius, config.wheel_width, 1.0);
+        }
+    }
+}
+
+fn place_bumpers(
+    configs: ResMut<Assets<CarConfig>>,
+    car: Query<(&Handle<CarConfig>, &CarComponents)>,
+    mut bumpers: Query<&mut Transform, With<Bumper>>,
+) {
+    for (config, components) in car.iter() {
+        let config = match configs.get(config.clone()) {
+            Some(config) => config,
+            None => continue,
+        };
+
+        {
+            let mut bumper = bumpers.get_mut(components.bumpers.front).unwrap();
+            bumper.translation = Vec3::new(config.centre_of_gravity_to_front, 0.0, 1.0);
+            bumper.scale = Vec3::new(0.1, 2.0 * config.half_width, 1.0);
+        }
+
+        {
+            let mut bumper = bumpers.get_mut(components.bumpers.rear).unwrap();
+            bumper.translation = Vec3::new(-config.centre_of_gravity_to_rear, 0.0, 1.0);
+            bumper.scale = Vec3::new(0.1, 2.0 * config.half_width, 1.0);
+        }
     }
 }
 
@@ -534,12 +711,15 @@ fn main() {
             ..Default::default()
         })
         .add_plugins(DefaultPlugins)
+        .add_asset::<CarConfig>()
+        .init_asset_loader::<CarConfigLoader>()
         .add_startup_system(setup.system())
         .add_system(step.system().label(MyStages::Physics))
         .add_system_set(
             SystemSet::new()
                 .with_system(place_weight_marker.system())
-                .with_system(animate_wheels.system())
+                .with_system(place_bumpers.system())
+                .with_system(place_tires.system())
                 .after(MyStages::Physics),
         )
         .run();
