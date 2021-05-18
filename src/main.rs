@@ -361,7 +361,13 @@ fn setup(
     mut materials: ResMut<Assets<ColorMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
-    commands.spawn_bundle(OrthographicCameraBundle::new_2d());
+    commands.spawn_bundle({
+        let mut camera = OrthographicCameraBundle::new_2d();
+
+        camera.orthographic_projection.scale = 1.0 / 16.0;
+
+        camera
+    });
     commands.spawn_bundle(UiCameraBundle::default());
 
     commands.spawn_bundle(TextBundle {
@@ -418,7 +424,6 @@ fn setup(
                 ..Default::default()
             },
             material: materials.add(ColorMaterial::color(Color::ORANGE_RED)),
-            transform: Transform::from_scale(16.0 * Vec3::ONE),
             ..Default::default()
         })
         .insert(config)
@@ -484,7 +489,7 @@ fn step(
             state.position = Vec2::ZERO;
         }
 
-        transform.translation = transform.scale * state.position.extend(1.0);
+        transform.translation = state.position.extend(1.0);
         transform.rotation = Quat::from_rotation_z(state.heading);
 
         for &entity in children.iter() {
