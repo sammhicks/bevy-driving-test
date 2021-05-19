@@ -3,6 +3,8 @@ use bevy::{
     math::Mat2,
     prelude::*,
     reflect::TypeUuid,
+    render::{mesh::Indices, pipeline::PrimitiveTopology},
+    transform::TransformSystem,
     utils::BoxedFuture,
 };
 
@@ -133,6 +135,7 @@ struct CarState {
 
 #[derive(Debug)]
 struct CarStats {
+    fps: i32,
     speed_mps: f32,
     speed_kph: f32,
     speed_mph: f32,
@@ -146,10 +149,10 @@ struct CarStats {
     front_right_friction: f32,
     rear_left_friction: f32,
     rear_right_friction: f32,
-    front_left_slipping: bool,
-    front_right_slipping: bool,
-    rear_left_slipping: bool,
-    rear_right_slipping: bool,
+    front_left_is_skidding: bool,
+    front_right_is_skidding: bool,
+    rear_left_is_skidding: bool,
+    rear_right_is_skidding: bool,
     weight_position: Vec2,
 }
 
@@ -237,13 +240,13 @@ fn physics_step(
     let rear_grip = config.total_tire_grip_rear
         * (1.0 - inputs.e_brake * (1.0 - config.e_brake_grip_ratio_rear));
 
-    let (front_left_slipping, front_left_friction) = clamp(
+    let (front_left_is_skidding, front_left_friction) = clamp(
         -config.corner_stiffness_front * slip_angle_front,
         -front_grip,
         front_grip,
     );
     let front_left_friction = front_left_friction * front_left_active_weight;
-    let (front_right_slipping, front_right_friction) = clamp(
+    let (front_right_is_skidding, front_right_friction) = clamp(
         -config.corner_stiffness_front * slip_angle_front,
         -front_grip,
         front_grip,
@@ -251,13 +254,13 @@ fn physics_step(
     let front_right_friction = front_right_friction * front_right_active_weight;
     let front_friction = 0.5 * (front_left_friction + front_right_friction);
 
-    let (rear_left_slipping, rear_left_friction) = clamp(
+    let (rear_left_is_skidding, rear_left_friction) = clamp(
         -config.corner_stiffness_rear * slip_angle_rear,
         -rear_grip,
         rear_grip,
     );
     let rear_left_friction = rear_left_friction * rear_left_active_weight;
-    let (rear_right_slipping, rear_right_friction) = clamp(
+    let (rear_right_is_skidding, rear_right_friction) = clamp(
         -config.corner_stiffness_rear * slip_angle_rear,
         -rear_grip,
         rear_grip,
@@ -323,6 +326,7 @@ fn physics_step(
     state.position += state.velocity * dt_seconds;
 
     CarStats {
+        fps: (1.0 / dt_seconds) as i32,
         speed_mps: absolute_velocity,
         speed_kph,
         speed_mph,
@@ -336,21 +340,28 @@ fn physics_step(
         front_right_friction,
         rear_left_friction,
         rear_right_friction,
-        front_left_slipping,
-        front_right_slipping,
-        rear_left_slipping,
-        rear_right_slipping,
+        front_left_is_skidding,
+        front_right_is_skidding,
+        rear_left_is_skidding,
+        rear_right_is_skidding,
         weight_position,
     }
 }
 
-struct Tire;
+struct PreviousGlobalTransform(GlobalTransform);
+
+struct Tire {
+    is_skidding: bool,
+}
+
+struct TireMaterial(Handle<ColorMaterial>);
 
 #[derive(Bundle)]
 struct TireBundle {
     #[bundle]
     sprite: SpriteBundle,
     tire: Tire,
+    previous_global_transform: PreviousGlobalTransform,
 }
 
 impl TireBundle {
@@ -364,7 +375,8 @@ impl TireBundle {
                 material,
                 ..Default::default()
             },
-            tire: Tire,
+            tire: Tire { is_skidding: false },
+            previous_global_transform: PreviousGlobalTransform(GlobalTransform::default()),
         }
     }
 }
@@ -421,6 +433,16 @@ struct CarBundle {
     global_transform: GlobalTransform,
 }
 
+struct DespawnAt(std::time::Duration);
+
+fn despawn_at(mut commands: Commands, time: Res<Time>, query: Query<(Entity, &DespawnAt)>) {
+    for (entity, &DespawnAt(despawn_time)) in query.iter() {
+        if time.time_since_startup() > despawn_time {
+            commands.entity(entity).despawn_recursive();
+        }
+    }
+}
+
 fn setup(
     mut commands: Commands,
     mut materials: ResMut<Assets<ColorMaterial>>,
@@ -473,7 +495,11 @@ fn setup(
     let rear_left = commands
         .spawn_bundle(TireBundle::new(tire_material.clone()))
         .id();
-    let rear_right = commands.spawn_bundle(TireBundle::new(tire_material)).id();
+    let rear_right = commands
+        .spawn_bundle(TireBundle::new(tire_material.clone()))
+        .id();
+
+    commands.insert_resource(TireMaterial(tire_material));
 
     let tires = Tires {
         front_left,
@@ -543,6 +569,7 @@ fn step(
         &CarComponents,
     )>,
     mut weight_marker: Query<&mut WeightMarker>,
+    mut tires: Query<&mut Tire>,
     mut text: Query<&mut Text, Without<CarState>>,
 ) {
     let input = |code: KeyCode| {
@@ -594,6 +621,23 @@ fn step(
             .get_mut(car_components.weight_marker)
             .unwrap()
             .position = stats.weight_position;
+
+        tires
+            .get_mut(car_components.tires.front_left)
+            .unwrap()
+            .is_skidding = stats.front_left_is_skidding;
+        tires
+            .get_mut(car_components.tires.front_right)
+            .unwrap()
+            .is_skidding = stats.front_right_is_skidding;
+        tires
+            .get_mut(car_components.tires.rear_left)
+            .unwrap()
+            .is_skidding = stats.rear_left_is_skidding;
+        tires
+            .get_mut(car_components.tires.rear_right)
+            .unwrap()
+            .is_skidding = stats.rear_right_is_skidding;
 
         text.single_mut().unwrap().sections[0].value = format!("{:#?}", stats);
     }
@@ -695,9 +739,82 @@ fn place_bumpers(
     }
 }
 
+fn srt_transform_vec(transform: GlobalTransform, mut value: Vec3) -> Vec3 {
+    value = transform.scale * value;
+    value = transform.rotation * value;
+    value += transform.translation;
+    value
+}
+
+fn skid(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    time: Res<Time>,
+    tire_material: Res<TireMaterial>,
+    tire: Query<(&Tire, &GlobalTransform, &PreviousGlobalTransform)>,
+) {
+    for (tire, &global_transform, &PreviousGlobalTransform(previous_global_transform)) in
+        tire.iter()
+    {
+        if tire.is_skidding {
+            let p1 = srt_transform_vec(previous_global_transform, 0.0 * Vec3::Y);
+            let p2 = srt_transform_vec(previous_global_transform, -0.5 * Vec3::Y);
+            let p3 = srt_transform_vec(global_transform, 0.0 * Vec3::Y);
+            let p4 = srt_transform_vec(global_transform, -0.5 * Vec3::Y);
+
+            let vertices = [
+                ([p1.x, p1.y, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0]),
+                ([p2.x, p2.y, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0]),
+                ([p3.x, p3.y, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0]),
+                ([p4.x, p4.y, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0]),
+            ];
+
+            let indices = Indices::U32(vec![0, 1, 2, 1, 3, 2, 0, 2, 1, 1, 2, 3]);
+
+            let mut positions = Vec::with_capacity(4);
+            let mut normals = Vec::with_capacity(4);
+            let mut uvs = Vec::with_capacity(4);
+            for (position, normal, uv) in vertices.iter() {
+                positions.push(*position);
+                normals.push(*normal);
+                uvs.push(*uv);
+            }
+
+            let mut mesh = Mesh::new(PrimitiveTopology::TriangleList);
+            mesh.set_indices(Some(indices));
+            mesh.set_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+            mesh.set_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+            mesh.set_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+
+            commands
+                .spawn_bundle(SpriteBundle {
+                    sprite: Sprite {
+                        size: Vec2::ONE,
+                        ..Default::default()
+                    },
+                    mesh: meshes.add(mesh),
+                    material: tire_material.0.clone(),
+                    ..Default::default()
+                })
+                .insert(DespawnAt(
+                    time.time_since_startup() + std::time::Duration::from_secs(10),
+                ));
+        }
+    }
+}
+
+fn update_previous_global_transform(
+    mut query: Query<(&mut PreviousGlobalTransform, &GlobalTransform)>,
+) {
+    for (mut previous, &current) in query.iter_mut() {
+        previous.0 = current;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, SystemLabel)]
 enum MyStages {
     Physics,
+    UpdatePreviousGlobalTransform,
 }
 
 fn main() {
@@ -721,6 +838,23 @@ fn main() {
                 .with_system(place_bumpers.system())
                 .with_system(place_tires.system())
                 .after(MyStages::Physics),
+        )
+        .add_system_set(SystemSet::new().with_system(skid.system()))
+        .add_system_set_to_stage(
+            CoreStage::PostUpdate,
+            SystemSet::new()
+                .with_system(
+                    skid.system()
+                        .before(MyStages::UpdatePreviousGlobalTransform)
+                        .after(TransformSystem::TransformPropagate),
+                )
+                .with_system(
+                    update_previous_global_transform
+                        .system()
+                        .label(MyStages::UpdatePreviousGlobalTransform)
+                        .after(TransformSystem::TransformPropagate),
+                )
+                .with_system(despawn_at.system()),
         )
         .run();
 }

@@ -26,5 +26,5 @@
     "steer_speed": 2.5,
     "speed_steer_correction": 60.0,
     "speed_turning_stability": 11.8,
-    "axle_distance_correction": 1.7
+    "axle_distance_correction": 1
 }
