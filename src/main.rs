@@ -3,6 +3,7 @@ use bevy::{
     math::Mat2,
     prelude::*,
     reflect::TypeUuid,
+    render::{mesh::VertexAttributeValues, pipeline::PrimitiveTopology},
     transform::TransformSystem,
     utils::BoxedFuture,
 };
@@ -15,6 +16,20 @@ fn clamp(t: f32, min: f32, max: f32) -> (bool, f32) {
         (true, max)
     } else {
         (false, t)
+    }
+}
+
+trait IntoArray: Sized {
+    type A;
+
+    fn into_array(self) -> Self::A;
+}
+
+impl IntoArray for Vec3 {
+    type A = [f32; 3];
+
+    fn into_array(self) -> Self::A {
+        [self.x, self.y, self.z]
     }
 }
 
@@ -353,18 +368,24 @@ struct Tire {
     is_skidding: bool,
 }
 
-struct TireMaterial(Handle<ColorMaterial>);
+struct CurrentSkid {
+    material: Handle<ColorMaterial>,
+    mesh: Option<Handle<Mesh>>,
+}
 
 #[derive(Bundle)]
 struct TireBundle {
     #[bundle]
     sprite: SpriteBundle,
     tire: Tire,
+    skid: CurrentSkid,
     previous_global_transform: PreviousGlobalTransform,
 }
 
 impl TireBundle {
     fn new(material: Handle<ColorMaterial>) -> Self {
+        let skid_material = material.clone();
+
         Self {
             sprite: SpriteBundle {
                 sprite: Sprite {
@@ -375,6 +396,10 @@ impl TireBundle {
                 ..Default::default()
             },
             tire: Tire { is_skidding: false },
+            skid: CurrentSkid {
+                material: skid_material,
+                mesh: None,
+            },
             previous_global_transform: PreviousGlobalTransform(GlobalTransform::default()),
         }
     }
@@ -432,12 +457,28 @@ struct CarBundle {
     global_transform: GlobalTransform,
 }
 
-struct DespawnAt(std::time::Duration);
+struct Skid;
 
-fn despawn_at(mut commands: Commands, time: Res<Time>, query: Query<(Entity, &DespawnAt)>) {
-    for (entity, &DespawnAt(despawn_time)) in query.iter() {
-        if time.time_since_startup() > despawn_time {
-            commands.entity(entity).despawn_recursive();
+#[derive(Bundle)]
+struct SkidBundle {
+    #[bundle]
+    sprite: SpriteBundle,
+    skid: Skid,
+}
+
+impl SkidBundle {
+    fn new(mesh: Handle<Mesh>, material: Handle<ColorMaterial>) -> Self {
+        Self {
+            sprite: SpriteBundle {
+                sprite: Sprite {
+                    size: Vec2::ONE,
+                    ..Default::default()
+                },
+                mesh,
+                material,
+                ..Default::default()
+            },
+            skid: Skid,
         }
     }
 }
@@ -494,11 +535,7 @@ fn setup(
     let rear_left = commands
         .spawn_bundle(TireBundle::new(tire_material.clone()))
         .id();
-    let rear_right = commands
-        .spawn_bundle(TireBundle::new(tire_material.clone()))
-        .id();
-
-    commands.insert_resource(TireMaterial(tire_material));
+    let rear_right = commands.spawn_bundle(TireBundle::new(tire_material)).id();
 
     let tires = Tires {
         front_left,
@@ -740,38 +777,101 @@ fn place_bumpers(
 
 fn skid(
     mut commands: Commands,
-    time: Res<Time>,
-    tire_material: Res<TireMaterial>,
-    tire: Query<(&Tire, &GlobalTransform, &PreviousGlobalTransform)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut tire: Query<(
+        &Tire,
+        &mut CurrentSkid,
+        &GlobalTransform,
+        &PreviousGlobalTransform,
+    )>,
 ) {
-    for (tire, &global_transform, &PreviousGlobalTransform(previous_global_transform)) in
-        tire.iter()
+    for (tire, mut skid, &global_transform, &PreviousGlobalTransform(previous_global_transform)) in
+        tire.iter_mut()
     {
-        if tire.is_skidding {
-            let previous_position = previous_global_transform.translation;
-            let current_position = global_transform.translation;
+        let previous_position = previous_global_transform.translation;
+        let current_position = global_transform.translation;
 
-            let offset = current_position - previous_position;
+        let offset = current_position - previous_position;
 
-            let transform = Transform {
-                translation: 0.5 * (previous_position + current_position),
-                rotation: Quat::from_rotation_z(f32::atan2(offset.y, offset.x)),
-                scale: Vec3::ONE,
-            };
+        let sideways = 0.5
+            * global_transform.scale.y
+            * Vec3::new(-offset.y, offset.x, 0.0).normalize_or_zero();
 
-            commands
-                .spawn_bundle(SpriteBundle {
-                    sprite: Sprite {
-                        size: Vec2::new(offset.length(), global_transform.scale.y),
-                        ..Default::default()
-                    },
-                    material: tire_material.0.clone(),
-                    transform,
-                    ..Default::default()
-                })
-                .insert(DespawnAt(
-                    time.time_since_startup() + std::time::Duration::from_secs(30),
-                ));
+        let p1 = (current_position - sideways).into_array();
+        let p2 = (current_position + sideways).into_array();
+        let n1 = [0.0, 0.0, 1.0];
+        let n2 = n1;
+        let uv1 = [0.0, 0.0];
+        let uv2 = [0.0, 0.0];
+
+        match (
+            tire.is_skidding,
+            skid.mesh.as_ref().and_then(|handle| meshes.get_mut(handle)),
+        ) {
+            (true, None) => {
+                let mut mesh = Mesh::new(PrimitiveTopology::TriangleStrip);
+                mesh.set_attribute(
+                    Mesh::ATTRIBUTE_POSITION,
+                    VertexAttributeValues::Float3(vec![p1, p2]),
+                );
+                mesh.set_attribute(
+                    Mesh::ATTRIBUTE_NORMAL,
+                    VertexAttributeValues::Float3(vec![n1, n2]),
+                );
+                mesh.set_attribute(
+                    Mesh::ATTRIBUTE_UV_0,
+                    VertexAttributeValues::Float2(vec![uv1, uv2]),
+                );
+
+                let handle = meshes.add(mesh);
+
+                skid.mesh = Some(handle.clone());
+
+                commands.spawn_bundle(SkidBundle::new(handle, skid.material.clone()));
+            }
+            (true, Some(mesh)) => {
+                match mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION).unwrap() {
+                    VertexAttributeValues::Float3(positions) => {
+                        positions.push(p1);
+                        positions.push(p2);
+                    }
+                    _ => panic!(),
+                }
+
+                match mesh.attribute_mut(Mesh::ATTRIBUTE_NORMAL).unwrap() {
+                    VertexAttributeValues::Float3(positions) => {
+                        positions.push(n1);
+                        positions.push(n2);
+                    }
+                    _ => panic!(),
+                }
+
+                match mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0).unwrap() {
+                    VertexAttributeValues::Float2(positions) => {
+                        positions.push(uv1);
+                        positions.push(uv2);
+                    }
+                    _ => panic!(),
+                }
+            }
+            (false, None) => (),
+            (false, Some(_mesh)) => {
+                skid.mesh = None;
+            }
+        }
+    }
+}
+
+fn cleanup_skids(
+    mut commands: Commands,
+    keyboard_input: Res<Input<KeyCode>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    skids: Query<(Entity, &Handle<Mesh>), With<Skid>>,
+) {
+    if keyboard_input.just_pressed(KeyCode::C) {
+        for (entity, handle) in skids.iter() {
+            commands.entity(entity).despawn();
+            meshes.remove(handle);
         }
     }
 }
@@ -810,9 +910,9 @@ fn main() {
                 .with_system(place_weight_marker.system())
                 .with_system(place_bumpers.system())
                 .with_system(place_tires.system())
+                .with_system(cleanup_skids.system())
                 .after(MyStages::Physics),
         )
-        .add_system_set(SystemSet::new().with_system(skid.system()))
         .add_system_set_to_stage(
             CoreStage::PostUpdate,
             SystemSet::new()
@@ -826,8 +926,7 @@ fn main() {
                         .system()
                         .label(MyStages::UpdatePreviousGlobalTransform)
                         .after(TransformSystem::TransformPropagate),
-                )
-                .with_system(despawn_at.system()),
+                ),
         )
         .run();
 }
