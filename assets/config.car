@@ -20,7 +20,7 @@
     "air_resistance": 2.5,
     "roll_resistance": 8.0,
     "e_brake_grip_ratio_front": 0.9,
-    "total_tire_grip_front": 2.5,
+    "total_tire_grip_front": 3.0,
     "e_brake_grip_ratio_rear": 0.4,
     "total_tire_grip_rear": 2.5,
     "steer_speed": 2.5,

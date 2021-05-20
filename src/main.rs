@@ -3,7 +3,6 @@ use bevy::{
     math::Mat2,
     prelude::*,
     reflect::TypeUuid,
-    render::{mesh::Indices, pipeline::PrimitiveTopology},
     transform::TransformSystem,
     utils::BoxedFuture,
 };
@@ -739,16 +738,8 @@ fn place_bumpers(
     }
 }
 
-fn srt_transform_vec(transform: GlobalTransform, mut value: Vec3) -> Vec3 {
-    value = transform.scale * value;
-    value = transform.rotation * value;
-    value += transform.translation;
-    value
-}
-
 fn skid(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
     time: Res<Time>,
     tire_material: Res<TireMaterial>,
     tire: Query<(&Tire, &GlobalTransform, &PreviousGlobalTransform)>,
@@ -757,47 +748,29 @@ fn skid(
         tire.iter()
     {
         if tire.is_skidding {
-            let p1 = srt_transform_vec(previous_global_transform, 0.0 * Vec3::Y);
-            let p2 = srt_transform_vec(previous_global_transform, -0.5 * Vec3::Y);
-            let p3 = srt_transform_vec(global_transform, 0.0 * Vec3::Y);
-            let p4 = srt_transform_vec(global_transform, -0.5 * Vec3::Y);
+            let previous_position = previous_global_transform.translation;
+            let current_position = global_transform.translation;
 
-            let vertices = [
-                ([p1.x, p1.y, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0]),
-                ([p2.x, p2.y, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0]),
-                ([p3.x, p3.y, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0]),
-                ([p4.x, p4.y, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0]),
-            ];
+            let offset = current_position - previous_position;
 
-            let indices = Indices::U32(vec![0, 1, 2, 1, 3, 2, 0, 2, 1, 1, 2, 3]);
-
-            let mut positions = Vec::with_capacity(4);
-            let mut normals = Vec::with_capacity(4);
-            let mut uvs = Vec::with_capacity(4);
-            for (position, normal, uv) in vertices.iter() {
-                positions.push(*position);
-                normals.push(*normal);
-                uvs.push(*uv);
-            }
-
-            let mut mesh = Mesh::new(PrimitiveTopology::TriangleList);
-            mesh.set_indices(Some(indices));
-            mesh.set_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-            mesh.set_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-            mesh.set_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+            let transform = Transform {
+                translation: 0.5 * (previous_position + current_position),
+                rotation: Quat::from_rotation_z(f32::atan2(offset.y, offset.x)),
+                scale: Vec3::ONE,
+            };
 
             commands
                 .spawn_bundle(SpriteBundle {
                     sprite: Sprite {
-                        size: Vec2::ONE,
+                        size: Vec2::new(offset.length(), global_transform.scale.y),
                         ..Default::default()
                     },
-                    mesh: meshes.add(mesh),
                     material: tire_material.0.clone(),
+                    transform,
                     ..Default::default()
                 })
                 .insert(DespawnAt(
-                    time.time_since_startup() + std::time::Duration::from_secs(10),
+                    time.time_since_startup() + std::time::Duration::from_secs(30),
                 ));
         }
     }
